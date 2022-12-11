@@ -1,0 +1,215 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: create
+Parameters:
+    KeyPair: # EC2 SSH 秘钥
+        Type: AWS::EC2::KeyPair::KeyName
+        Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+        ConstraintDescription: must be the name of an existing EC2 KeyPair
+        Default: us-east-1-key
+
+    EnvType: # 环境类型， 后续可以使用条件语句，不同环境不同配置
+        Type: String
+        Description: Environment type
+        Default: dev
+        AllowedValues:
+            - dev # 开发环境
+            - prod # 生产环境
+        ConstraintDescription: Choice Env Type to Select Instance Type
+
+Mappings:
+    AWSRegionArch2AMI: # 镜像映射
+        ap-northeast-2:
+            HVMG2: ami-03461b78fdba0ff9d
+        ap-southeast-2:
+            HVMG2: ami-09f765d333a8ebb4b
+        us-east-1:
+            HVMG2: ami-0022f774911c1d690
+        us-west-1:
+            HVMG2: ami-02541b8af977f6cdd
+
+
+
+
+Conditions:
+    CreateProdResources: # 条件一：CreateProdResources 生产环境
+        Fn::Equals:
+            - !Ref EnvType
+            - prod
+    CreateDevResources: # 条件二：CreateDevResources 开发环境
+        Fn::Equals:
+            - !Ref EnvType
+            - dev
+
+Resources:
+  v2rayIGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: v2rayIGW
+
+  v2rayVPC:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: 10.66.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: v2rayVPC
+
+  #  将igw关联至vpc
+  AttachGW:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      VpcId: !Ref v2rayVPC
+      InternetGatewayId: !Ref v2rayIGW
+
+  # 子网 v2rayNet1
+  v2rayNet1:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: # 选择第一个（0）AZ
+        "Fn::Select":
+          - 0
+          - "Fn::GetAZs": ""
+      CidrBlock: 10.66.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: v2ray-Net-1
+      VpcId: !Ref v2rayVPC
+
+  # 路由表,关联VPC
+  v2rayRouteTable:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref v2rayVPC
+      Tags:
+        - Key: Name
+          Value: v2ray_Route_Table
+
+  # 将v2rayNet association至corresponding的路由表
+  v2rayNet1Association:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      RouteTableId: !Ref v2rayRouteTable
+      SubnetId: !Ref v2rayNet1
+
+  # configure default route
+  v2rayRouteTableDefaultRoute:
+    Type: "AWS::EC2::Route"
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref v2rayIGW
+      RouteTableId: !Ref v2rayRouteTable
+
+  # 创建SG
+  v2raySecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupName: v2ray_sg
+      GroupDescription: Allow tcp/udp port 443/22
+      VpcId: !Ref v2rayVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+
+  DeployV2rayRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+                Service:
+                    - "ec2.amazonaws.com"
+            Action:
+                - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/AmazonS3FullAccess
+          - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+          - arn:aws:iam::aws:policy/AmazonSSMFullAccess
+  v2rayRoleInstanceProfile:
+        Type: 'AWS::IAM::InstanceProfile'
+        Properties:
+            Path: /
+            Roles:
+                - !Ref DeployV2rayRole
+
+
+  NICs: # EC2调用的网卡
+        Type: "AWS::EC2::NetworkInterface"
+        Properties:
+            GroupSet: # 关联SecurityGroup
+                - !Ref v2raySecurityGroup
+            SubnetId: !Ref v2rayNet1
+  v2rayInstance:
+        Type: "AWS::EC2::Instance"
+        Properties:
+            InstanceType: # 根据不同环境选择不同的实例类型
+                Fn::If:
+                    - CreateProdResources
+                    - t2.nano
+                    - Fn::If:
+                          - CreateDevResources
+                          - t2.nano
+                          - t2.nano
+            Tags: # EC2的标签
+                -   Key: Name
+                    Value: v2ray_EC2
+            KeyName: # EC2使用的秘钥名
+                Ref: KeyPair
+            UserData: # EC2的UserData
+                "Fn::Base64": !Sub |
+                    #!/bin/bash
+                    sudo yum update -y
+                    sudo wget https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh
+                    sudo chmod +x install-release.sh
+                    sudo ./install-release.sh
+                    sudo aws s3 cp s3://v2rayconfig/config.json-ok /usr/local/etc/v2ray/config.json
+                    sudo systemctl start v2ray
+                    sudo systemctl enable v2ray
+                    sudo systemctl status v2ray
+
+            IamInstanceProfile: !Ref v2rayRoleInstanceProfile # IAM Role
+            NetworkInterfaces:
+                - NetworkInterfaceId: !Ref NICs # 关联网络接口
+                  DeviceIndex: 0
+            ImageId: # 找到特定Region的镜像ID
+                Fn::FindInMap:
+                    - AWSRegionArch2AMI
+                    - Ref: AWS::Region
+                    - HVMG2
+
+Outputs: # 输出内容，并且可以被其他Stack引用
+  SecurityGroupWebSSH:
+    Description: Security Allow v2ray and SSH
+    Value: !Ref v2raySecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-SecurityGroupv2ray-ID
+
+  InstanceId: # 输出EC2的实例ID
+      Description: InstanceId of the newly created EC2 instance
+      Value: !Ref v2rayInstance
+
+  PublicDNS: # 输出EC2的公网DNS域名
+      Description: Public DNSName of the newly created EC2 instance
+      Value: !GetAtt v2rayInstance.PublicDnsName
+
+  PublicIP: # 输出EC2的公网IP
+      Description: Public IP address of the newly created EC2 instance
+      Value: !GetAtt v2rayInstance.PublicIp

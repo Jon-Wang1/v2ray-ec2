@@ -1,0 +1,112 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: create
+Resources:
+  v2rayIGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: v2rayIGW
+
+  v2rayVPC:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: 10.66.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: v2rayVPC
+
+  #  将igw关联至vpc
+  AttachGW:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      VpcId: !Ref v2rayVPC
+      InternetGatewayId: !Ref v2rayIGW
+
+  # 子网 v2rayNet1
+  v2rayNet1:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: # 选择第一个（0）AZ
+        "Fn::Select":
+          - 0
+          - "Fn::GetAZs": ""
+      CidrBlock: 10.66.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: v2ray-Net-1
+      VpcId: !Ref v2rayVPC
+
+  # 路由表,关联VPC
+  v2rayRouteTable:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref v2rayVPC
+      Tags:
+        - Key: Name
+          Value: v2ray_Route_Table
+
+  # 将v2rayNet association至corresponding的路由表
+  v2rayNet1Association:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      RouteTableId: !Ref v2rayRouteTable
+      SubnetId: !Ref v2rayNet1
+
+  # configure default route
+  v2rayRouteTableDefaultRoute:
+    Type: "AWS::EC2::Route"
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref v2rayIGW
+      RouteTableId: !Ref v2rayRouteTable
+
+  # 创建SG
+  v2raySecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupName: v2ray_sg
+      GroupDescription: Allow tcp/udp port 443/22
+      VpcId: !Ref v2rayVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+
+Outputs: # 输出内容，并且可以被其他Stack引用
+  # AvailabilityZone1
+  AZ:
+    Description: Availability Zone of the newly created v2rayNet-1
+    Value: !GetAtt v2rayNet1.AvailabilityZone
+
+  # VPCID, 输出名为${AWS::StackName}-VPCID
+  VPCId:
+    Description: VPC ID
+    Value: !Ref v2rayVPC
+    Export:
+      Name: !Sub ${AWS::StackName}-VPCID
+
+  v2rayNet1:
+    Description: The subnet ID of v2rayNet1
+    Value: !Ref v2rayNet1
+    Export:
+      Name: !Sub ${AWS::StackName}-v2rayNet1-ID
+
+  SecurityGroupWebSSH:
+    Description: Security Allow v2ray and SSH
+    Value: !Ref v2raySecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-SecurityGroupv2ray-ID

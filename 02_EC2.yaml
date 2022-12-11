@@ -1,0 +1,140 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Create v2ray EC2
+Parameters:
+    KeyPair: # EC2 SSH 秘钥
+        Type: AWS::EC2::KeyPair::KeyName
+        Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+        ConstraintDescription: must be the name of an existing EC2 KeyPair
+        Default: us-east-1-key
+
+    EnvType: # 环境类型， 后续可以使用条件语句，不同环境不同配置
+        Type: String
+        Description: Environment type
+        Default: dev
+        AllowedValues:
+            - dev # 开发环境
+            - prod # 生产环境
+        ConstraintDescription: Choice Env Type to Select Instance Type
+
+    VPCStackName: # 引用之前的Stack
+        Type: String
+        Description: Name of an active CloudFormation stack that contains the networking resources, such as the subnet and security group, that will be used in this stack.
+        MinLength: 1
+        MaxLength: 255
+        AllowedPattern: "^[a-zA-Z][-a-zA-Z0-9]*$"
+        Default: v2rayVPC
+
+
+
+Mappings:
+    AWSRegionArch2AMI: # 镜像映射
+        ap-northeast-2:
+            HVMG2: ami-03461b78fdba0ff9d
+        ap-southeast-2:
+            HVMG2: ami-09f765d333a8ebb4b
+        us-east-1:
+            HVMG2: ami-0022f774911c1d690
+
+
+
+
+Conditions:
+    CreateProdResources: # 条件一：CreateProdResources 生产环境
+        Fn::Equals:
+            - !Ref EnvType
+            - prod
+    CreateDevResources: # 条件二：CreateDevResources 开发环境
+        Fn::Equals:
+            - !Ref EnvType
+            - dev
+
+
+
+Resources:
+    DeployV2rayRole:
+        Type: 'AWS::IAM::Role'
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service:
+                              - "ec2.amazonaws.com"
+                      Action:
+                          - 'sts:AssumeRole'
+            Path: /
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/AmazonS3FullAccess
+                - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+                - arn:aws:iam::aws:policy/AmazonSSMFullAccess
+    v2rayRoleInstanceProfile:
+        Type: 'AWS::IAM::InstanceProfile'
+        Properties:
+            Path: /
+            Roles:
+                - !Ref DeployV2rayRole
+
+
+    NICs: # EC2调用的网卡
+        Type: "AWS::EC2::NetworkInterface"
+        Properties:
+            GroupSet: # 关联SecurityGroup
+                - "Fn::ImportValue": !Sub ${VPCStackName}-SecurityGroupv2ray-ID
+            SubnetId: # 关联子网
+                "Fn::ImportValue": !Sub ${VPCStackName}-v2rayNet1-ID
+
+    v2rayInstance:
+        Type: "AWS::EC2::Instance"
+        Properties:
+            InstanceType: # 根据不同环境选择不同的实例类型
+                Fn::If:
+                    - CreateProdResources
+                    - t2.nano
+                    - Fn::If:
+                          - CreateDevResources
+                          - t2.nano
+                          - t2.nano
+            Tags: # EC2的标签
+                -   Key: Name
+                    Value: v2ray_CF_EC2
+            KeyName: # EC2使用的秘钥名
+                Ref: KeyPair
+            UserData: # EC2的UserData
+                "Fn::Base64": !Sub |
+                    #!/bin/bash
+                    sudo -i
+                    bash <<(curl -L https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-dat-release.sh)
+                    exit
+                    sudo aws s3 cp s3://v2rayconfig/config.json-ok /usr/local/etc/v2ray/config.json
+                    sudo systemctl start v2ray
+                    sudo systemctl enable v2ray
+                    sudo systemctl status v2ray
+
+            IamInstanceProfile: !Ref v2rayRoleInstanceProfile # IAM Role
+            NetworkInterfaces:
+                - NetworkInterfaceId: !Ref NICs # 关联网络接口
+                  DeviceIndex: 0
+            ImageId: # 找到特定Region的镜像ID
+                Fn::FindInMap:
+                    - AWSRegionArch2AMI
+                    - Ref: AWS::Region
+                    - HVMG2
+#        DependsOn: myDynamoDBTable # 需要先等DynamoDB表创建完成
+
+Outputs:
+    InstanceId: # 输出EC2的实例ID
+        Description: InstanceId of the newly created EC2 instance
+        Value: !Ref v2rayInstance
+
+    AZ: # 输出EC2的可用区域
+        Description: Availability Zone of the newly created EC2 instance
+        Value: !GetAtt v2rayInstance.AvailabilityZone
+
+    PublicDNS: # 输出EC2的公网DNS域名
+        Description: Public DNSName of the newly created EC2 instance
+        Value: !GetAtt v2rayInstance.PublicDnsName
+
+    PublicIP: # 输出EC2的公网IP
+        Description: Public IP address of the newly created EC2 instance
+        Value: !GetAtt v2rayInstance.PublicIp
